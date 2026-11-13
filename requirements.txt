@@ -1,3 +1,8 @@
 yt-dlp[default]
 python-telegram-bot[webhooks]>=21
 imageio-ffmpeg
+curl_cffi
+
+
+
+
