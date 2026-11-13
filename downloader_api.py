@@ -217,6 +217,9 @@ def list_profile(url, limit):
     some egress IPs with an empty response while video pages pass."""
     url = _normalize_url(url)
     opts = _base_opts()
+    opts["noplaylist"] = False  # _base_opts sets noplaylist=True for single
+    # videos; a profile IS a playlist — without this the extractor parses
+    # the page as one video and fails with "Failed to parse JSON".
     opts["extract_flat"] = True
     opts["playlistend"] = limit
     opts["skip_download"] = True
