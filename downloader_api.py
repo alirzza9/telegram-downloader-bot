@@ -20,15 +20,101 @@ import json
 import os
 import re
 import shutil
+import socket
+import subprocess
 import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import yt_dlp
 
 TOKEN = os.environ.get("TOKEN", "")
 PORT = int(os.environ.get("PORT", "10000"))
+
+# Optional VLESS proxy (env VLESS_URL, a vless:// link). sing-box is
+# downloaded at build time to sing-box-bin/sing-box; at startup it is
+# launched with a generated config and yt-dlp routes the blocked hosts
+# (TikTok/YouTube/Instagram) through its local SOCKS5. Everything else
+# goes direct. If the proxy is down, those hosts fall back to direct.
+VLESS_URL = os.environ.get("VLESS_URL", "")
+SINGBOX_BIN = os.environ.get("SINGBOX_BIN") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "sing-box-bin", "sing-box")
+PROXY_SOCKS = "socks5h://127.0.0.1:1080"
+PROXY_HOSTS = ("tiktok.com", "youtube.com", "youtu.be",
+               "instagram.com", "instagr.am")
+PROXY_UP = False
+
+
+def _parse_vless(url):
+    u = urlparse(url)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    raw_path = unquote(q.get("path", "/"))
+    ed = 0
+    path = raw_path
+    if "?ed=" in raw_path:
+        path, ed_s = raw_path.split("?ed=", 1)
+        ed = int(ed_s)
+    host = q.get("host", "") or q.get("sni", "")
+    sni = q.get("sni", "") or host
+    return {"server": u.hostname, "port": u.port or 443, "uuid": u.username,
+            "path": path, "ed": ed, "host": host, "sni": sni}
+
+
+def _start_singbox():
+    """Launch sing-box with the VLESS config. Returns True if the local
+    SOCKS5 answers, else False (callers fall back to direct)."""
+    global PROXY_UP
+    if not VLESS_URL or not os.path.exists(SINGBOX_BIN):
+        return False
+    try:
+        v = _parse_vless(VLESS_URL)
+        cfg = {
+            "log": {"level": "error"},
+            "inbounds": [{"type": "socks", "tag": "socks-in",
+                          "listen": "127.0.0.1", "listen_port": 1080}],
+            "outbounds": [{
+                "type": "vless", "tag": "proxy",
+                "server": v["server"], "server_port": v["port"],
+                "uuid": v["uuid"], "flow": "",
+                "tls": {"enabled": True, "server_name": v["sni"],
+                        "insecure": True, "alpn": ["http/1.1"],
+                        "utls": {"enabled": True, "fingerprint": "chrome"}},
+                "transport": {"type": "ws", "path": v["path"],
+                              "headers": {"Host": v["host"]},
+                              "max_early_data": v["ed"],
+                              "early_data_header_name": "Sec-WebSocket-Protocol"},
+            }],
+        }
+        cfg_path = os.path.join(tempfile.gettempdir(), "sing-box-render.json")
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        os.chmod(cfg_path, 0o600)
+        subprocess.Popen([SINGBOX_BIN, "run", "-c", cfg_path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(30):
+            try:
+                with socket.create_connection(("127.0.0.1", 1080), timeout=1):
+                    PROXY_UP = True
+                    return True
+            except OSError:
+                time.sleep(1)
+    except Exception:
+        pass
+    return False
+
+
+def _proxy_for(url):
+    if not PROXY_UP:
+        return None
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return None
+    for suf in PROXY_HOSTS:
+        if host == suf or host.endswith("." + suf):
+            return PROXY_SOCKS
+    return None
 
 YOUTUBE_COOKIES = "/etc/secrets/youtube_cookies.txt"
 INSTAGRAM_COOKIES = "/etc/secrets/instagram_cookies.txt"
@@ -95,6 +181,7 @@ def extract(url):
             opts = _base_opts()
             opts["skip_download"] = True
             opts["socket_timeout"] = 20
+            opts["proxy"] = _proxy_for(url)
             ck = _cookies_for(url)
             if ck:
                 opts["cookiefile"] = ck
@@ -129,6 +216,7 @@ def download_file(url, fmt):
     try:
         opts = _base_opts()
         opts["format"] = fmt
+        opts["proxy"] = _proxy_for(url)
         opts["merge_output_format"] = "mp4"
         opts["outtmpl"] = os.path.join(tmp, "%(id)s.%(ext)s")
         ck = _cookies_for(url)
@@ -218,4 +306,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    _start_singbox()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
