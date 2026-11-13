@@ -212,15 +212,26 @@ DEFAULT_FMT = "bv*[height<=720]+ba/b[height<=720]/b"
 
 def list_profile(url, limit):
     """Flat playlist listing of a TikTok/Instagram profile: video ids,
-    titles and page URLs only — no media downloaded. Used by /dlall."""
+    titles and page URLs only — no media downloaded. Used by /dlall.
+    Tries the proxy first, then direct: TikTok's profile page rejects
+    some egress IPs with an empty response while video pages pass."""
     url = _normalize_url(url)
     opts = _base_opts()
     opts["extract_flat"] = True
     opts["playlistend"] = limit
-    opts["proxy"] = _proxy_for(url)
     opts["skip_download"] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    last_err = None
+    for proxy in (_proxy_for(url), None):
+        opts["proxy"] = proxy
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    else:
+        raise last_err
     videos = []
     for e in (info.get("entries") or []):
         if not e:
