@@ -317,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/":
-            return self._send(200, {"ok": True})
+            return self._send(200, {"ok": True, "proxy": PROXY_UP})
         if u.path not in ("/info", "/file", "/dlall"):
             return self._send(404, {"error": "not found"})
         if TOKEN and not hmac.compare_digest(q.get("token", [""])[0], TOKEN):
@@ -334,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._send(200, list_profile(url, limit))
             except Exception as e:
-                self._send(502, {"error": str(e)[:500]})
+                self._send(502, {"error": str(e)[:500], "proxy": PROXY_UP})
             return
         if u.path == "/info":
             try:
