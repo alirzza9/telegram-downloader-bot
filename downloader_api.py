@@ -10,6 +10,9 @@ trendify-agent Worker can point at this service instead:
         quality=mp3 -> best audio extracted to MP3 192k (SoundCloud,
         YouTube audio). Video qualities: 360/480/720/1080 (default 720);
         direct-media links use 1080 for the highest available quality.
+  GET /dlall?url=..&limit=200&token=.. -> flat playlist listing of a
+        TikTok/Instagram profile: {"count": N, "videos": [{id, title,
+        url, uploader, duration}]} — no media downloaded.
 
 Auth: ?token=<TOKEN env>. No proxy: Render egress is direct.
 YouTube cookies (optional): /etc/secrets/youtube_cookies.txt
@@ -207,6 +210,28 @@ FORMAT_FOR_QUALITY = {
 DEFAULT_FMT = "bv*[height<=720]+ba/b[height<=720]/b"
 
 
+def list_profile(url, limit):
+    """Flat playlist listing of a TikTok/Instagram profile: video ids,
+    titles and page URLs only — no media downloaded. Used by /dlall."""
+    url = _normalize_url(url)
+    opts = _base_opts()
+    opts["extract_flat"] = True
+    opts["playlistend"] = limit
+    opts["proxy"] = _proxy_for(url)
+    opts["skip_download"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    videos = []
+    for e in (info.get("entries") or []):
+        if not e:
+            continue
+        videos.append({"id": e.get("id"), "title": e.get("title"),
+                       "url": e.get("webpage_url") or e.get("url") or "",
+                       "uploader": e.get("uploader"),
+                       "duration": e.get("duration")})
+    return {"count": len(videos), "videos": videos}
+
+
 def download_file(url, fmt, audio=False):
     url = _normalize_url(url)
     tmp = tempfile.mkdtemp(prefix="ytdl-")
@@ -279,13 +304,24 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/":
             return self._send(200, {"ok": True})
-        if u.path not in ("/info", "/file"):
+        if u.path not in ("/info", "/file", "/dlall"):
             return self._send(404, {"error": "not found"})
         if TOKEN and not hmac.compare_digest(q.get("token", [""])[0], TOKEN):
             return self._send(401, {"error": "unauthorized"})
         url = q.get("url", [""])[0]
         if not url.startswith(("http://", "https://")):
             return self._send(400, {"error": "bad url"})
+        if u.path == "/dlall":
+            try:
+                limit = int(q.get("limit", ["200"])[0])
+            except Exception:
+                limit = 200
+            limit = max(1, min(200, limit))
+            try:
+                self._send(200, list_profile(url, limit))
+            except Exception as e:
+                self._send(502, {"error": str(e)[:500]})
+            return
         if u.path == "/info":
             try:
                 self._send(200, extract(url))
