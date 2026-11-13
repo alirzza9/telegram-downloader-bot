@@ -34,15 +34,14 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 # Optional VLESS proxy (env VLESS_URL, a vless:// link). sing-box is
 # downloaded at build time to sing-box-bin/sing-box; at startup it is
-# launched with a generated config and yt-dlp routes the blocked hosts
-# (TikTok/YouTube/Instagram) through its local SOCKS5. Everything else
-# goes direct. If the proxy is down, those hosts fall back to direct.
+# launched with a generated config and ALL yt-dlp traffic goes through
+# its local SOCKS5 (the extractors also call sibling API hosts such as
+# tiktokv.com / googlevideo.com that a per-host allowlist would miss).
+# Everything falls back to direct if the proxy is down.
 VLESS_URL = os.environ.get("VLESS_URL", "")
 SINGBOX_BIN = os.environ.get("SINGBOX_BIN") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "sing-box-bin", "sing-box")
 PROXY_SOCKS = "socks5h://127.0.0.1:1080"
-PROXY_HOSTS = ("tiktok.com", "youtube.com", "youtu.be",
-               "instagram.com", "instagr.am")
 PROXY_UP = False
 
 
@@ -105,16 +104,11 @@ def _start_singbox():
 
 
 def _proxy_for(url):
-    if not PROXY_UP:
-        return None
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except Exception:
-        return None
-    for suf in PROXY_HOSTS:
-        if host == suf or host.endswith("." + suf):
-            return PROXY_SOCKS
-    return None
+    # Route ALL yt-dlp traffic through the proxy when it is up: the
+    # extractors also call sibling API hosts (tiktokv.com, googlevideo.com)
+    # that a per-host allowlist would miss and that fail direct from
+    # Render's IP. Falls back to direct when the proxy is down.
+    return PROXY_SOCKS if PROXY_UP else None
 
 YOUTUBE_COOKIES = "/etc/secrets/youtube_cookies.txt"
 INSTAGRAM_COOKIES = "/etc/secrets/instagram_cookies.txt"
