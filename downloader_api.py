@@ -7,6 +7,9 @@ trendify-agent Worker can point at this service instead:
   GET /file?url=..&quality=720&token=.. -> downloads, merges to mp4,
         and serves the file itself (link delivery; the file is deleted
         after serving — Render free disk is ephemeral anyway).
+        quality=mp3 -> best audio extracted to MP3 192k (SoundCloud,
+        YouTube audio). Video qualities: 360/480/720/1080 (default 720);
+        direct-media links use 1080 for the highest available quality.
 
 Auth: ?token=<TOKEN env>. No proxy: Render egress is direct.
 YouTube cookies (optional): /etc/secrets/youtube_cookies.txt
@@ -204,14 +207,19 @@ FORMAT_FOR_QUALITY = {
 DEFAULT_FMT = "bv*[height<=720]+ba/b[height<=720]/b"
 
 
-def download_file(url, fmt):
+def download_file(url, fmt, audio=False):
     url = _normalize_url(url)
     tmp = tempfile.mkdtemp(prefix="ytdl-")
     try:
         opts = _base_opts()
         opts["format"] = fmt
         opts["proxy"] = _proxy_for(url)
-        opts["merge_output_format"] = "mp4"
+        if audio:
+            opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
+                                       "preferredcodec": "mp3",
+                                       "preferredquality": "192"}]
+        else:
+            opts["merge_output_format"] = "mp4"
         opts["outtmpl"] = os.path.join(tmp, "%(id)s.%(ext)s")
         ck = _cookies_for(url)
         if ck:
@@ -256,12 +264,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path, filename, size):
+    def _send_file(self, path, filename, size, content_type="video/mp4", ext="mp4"):
         self.send_response(200)
-        self.send_header("content-type", "video/mp4")
+        self.send_header("content-type", content_type)
         self.send_header("content-length", str(size))
         safe = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename)[:120]
-        self.send_header("content-disposition", f'attachment; filename="{safe}.mp4"')
+        self.send_header("content-disposition", f'attachment; filename="{safe}.{ext}"')
         self.end_headers()
         with open(path, "rb") as f:
             shutil.copyfileobj(f, self.wfile, length=1024 * 256)
@@ -285,6 +293,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(502, {"error": str(e)[:500]})
             return
         quality = q.get("quality", [""])[0]
+        if quality == "mp3":
+            try:
+                tmp, path, title, size = download_file(url, "ba/bestaudio", audio=True)
+            except Exception as e:
+                return self._send(502, {"error": str(e)[:500]})
+            try:
+                self._send_file(path, title, size, "audio/mpeg", "mp3")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
         fmt = FORMAT_FOR_QUALITY.get(quality, DEFAULT_FMT)
         try:
             tmp, path, title, size = download_file(url, fmt)
