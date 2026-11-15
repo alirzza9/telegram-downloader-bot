@@ -19,6 +19,10 @@ trendify-agent Worker can point at this service instead:
         "page_url","embed_url"} (a JAV file is 1-3 GB, over the /file
         cap, so the direct stream link is returned for browser/IDM
         download instead of a served file).
+  GET /tube?url=..&token=<TOKEN> -> tube post page (TakTube / LotiClip /
+        any yt-dlp page) resolved to its direct MP4, downloaded with
+        parallel Range requests (takcdn cuts full GETs) and served as
+        the file itself. A direct .mp4 URL is downloaded as-is.
 
 Auth: ?token=<TOKEN env>. No proxy: Render egress is direct.
 YouTube cookies (optional): /etc/secrets/youtube_cookies.txt
@@ -36,6 +40,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -566,6 +571,129 @@ def download_file(url, fmt, audio=False):
         raise
 
 
+# ---------------------------------------------------------------------------
+# /tube: tube post pages (TakTube / LotiClip). The generic yt-dlp extractor
+# resolves the post page to a direct takcdn MP4, but a full GET of that MP4
+# gets cut off by takcdn (HTTP 000) — only parallel Range requests work
+# (the VM recipe: 5 MB chunks, 32 parallel, ~650 KB/s). So the MP4 is
+# downloaded here with ranged chunks and served as the file itself.
+# ---------------------------------------------------------------------------
+_TUBE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+_TUBE_CHUNK = 5 * 1024 * 1024
+_TUBE_WORKERS = 32
+
+
+def _tube_proxies():
+    """Proxy list to try, in order: VLESS SOCKS first (Render's datacenter
+    IP gets blocked by video hosts), then direct."""
+    if PROXY_UP:
+        return [{"http": PROXY_SOCKS, "https": PROXY_SOCKS}, None]
+    return [None]
+
+
+def _tube_get_total(mp4_url, referer):
+    """Total file size via a Range 0-0 request (Content-Range)."""
+    if _cf_requests is None:
+        raise RuntimeError("curl_cffi not installed")
+    last_err = None
+    for proxies in _tube_proxies():
+        try:
+            r = _cf_requests.get(mp4_url, impersonate="chrome", proxies=proxies,
+                                 headers={"User-Agent": _TUBE_UA, "Referer": referer,
+                                          "Range": "bytes=0-0"}, timeout=30)
+            if r.status_code == 200:
+                n = r.headers.get("Content-Length")
+                if n:
+                    return int(n)
+                continue
+            if r.status_code == 206:
+                m = re.search(r"/(\d+)\s*$", r.headers.get("Content-Range", ""))
+                if m:
+                    return int(m.group(1))
+            last_err = RuntimeError(f"HTTP {r.status_code}")
+        except Exception as e:
+            last_err = e
+    raise last_err or RuntimeError("could not get file size")
+
+
+def _tube_chunk(args):
+    mp4_url, referer, start, end, idx, parts = args
+    headers = {"User-Agent": _TUBE_UA, "Referer": referer,
+               "Range": f"bytes={start}-{end}"}
+    last_err = None
+    for proxies in _tube_proxies():
+        for attempt in range(3):
+            try:
+                r = _cf_requests.get(mp4_url, impersonate="chrome", proxies=proxies,
+                                     headers=headers, timeout=300)
+                if r.status_code in (200, 206) and len(r.content) == end - start + 1:
+                    with open(os.path.join(parts, f"part{idx}"), "wb") as f:
+                        f.write(r.content)
+                    return idx
+                last_err = RuntimeError(f"HTTP {r.status_code} len={len(r.content)}")
+            except Exception as e:
+                last_err = e
+            time.sleep(2)
+    raise last_err or RuntimeError(f"chunk {idx} failed")
+
+
+def download_ranged(mp4_url, referer):
+    """Download a direct MP4 with parallel Range requests. Returns
+    (tmp, path, size)."""
+    if _cf_requests is None:
+        raise RuntimeError("curl_cffi not installed")
+    total = _tube_get_total(mp4_url, referer)
+    if total > MAX_FILE_BYTES:
+        raise RuntimeError("file too large")
+    tmp = tempfile.mkdtemp(prefix="tube-")
+    parts = os.path.join(tmp, "parts")
+    os.makedirs(parts, exist_ok=True)
+    try:
+        jobs = []
+        idx = 0
+        start = 0
+        while start < total:
+            end = min(start + _TUBE_CHUNK - 1, total - 1)
+            jobs.append((mp4_url, referer, start, end, idx, parts))
+            start = end + 1
+            idx += 1
+        with ThreadPoolExecutor(max_workers=_TUBE_WORKERS) as ex:
+            list(ex.map(_tube_chunk, jobs))
+        path = os.path.join(tmp, "video.mp4")
+        # Numeric order: NEVER `cat part*` (part10 sorts after part1).
+        with open(path, "wb") as out:
+            for j in range(len(jobs)):
+                with open(os.path.join(parts, f"part{j}"), "rb") as f:
+                    shutil.copyfileobj(f, out, length=1024 * 256)
+        shutil.rmtree(parts, ignore_errors=True)
+        if os.path.getsize(path) != total:
+            raise RuntimeError("size mismatch after ranged download")
+        return tmp, path, total
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def tube_download(url):
+    """Resolve a tube post page to its direct MP4 and download it with
+    parallel Range requests. Returns (tmp, path, title, size)."""
+    url = _normalize_url(url)
+    if re.search(r"\.mp4(\?|$)", url, re.I):
+        mp4_url = url
+        title = os.path.basename(urlparse(url).path) or "video"
+        referer = url
+    else:
+        info = extract(url)
+        mp4_url = info.get("url") or (info.get("formats") or [{}])[0].get("url")
+        if not mp4_url:
+            raise RuntimeError("no direct media URL found on this page")
+        title = info.get("title") or info.get("id") or "video"
+        referer = info.get("webpage_url") or url
+    tmp, path, size = download_ranged(mp4_url, referer)
+    return tmp, path, title, size
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -590,7 +718,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/":
             return self._send(200, {"ok": True, "proxy": PROXY_UP})
-        if u.path not in ("/info", "/file", "/dlall", "/jav", "/search"):
+        if u.path not in ("/info", "/file", "/dlall", "/jav", "/search", "/tube"):
             return self._send(404, {"error": "not found"})
         if TOKEN and not hmac.compare_digest(q.get("token", [""])[0], TOKEN):
             return self._send(401, {"error": "unauthorized"})
@@ -617,6 +745,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, search_first(query, engine))
             except Exception as e:
                 return self._send(502, {"error": str(e)[:500], "proxy": PROXY_UP})
+        if u.path == "/tube":
+            url = q.get("url", [""])[0]
+            if not url.startswith(("http://", "https://")):
+                return self._send(400, {"error": "bad url"})
+            try:
+                tmp, path, title, size = tube_download(url)
+            except Exception as e:
+                return self._send(502, {"error": str(e)[:500]})
+            try:
+                self._send_file(path, title, size)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return
         url = q.get("url", [""])[0]
         if not url.startswith(("http://", "https://")):
             return self._send(400, {"error": "bad url"})
