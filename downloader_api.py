@@ -207,6 +207,37 @@ def extract(url):
             "url": info.get("url"), "formats": formats}
 
 
+def search_first(query, engine="sc"):
+    """Resolve a song/video name to the first match via yt-dlp search
+    (SoundCloud 'sc' default, YouTube 'yt'). Returns {id, title,
+    uploader, duration, webpage_url, engine}. Tries the VLESS proxy
+    first, then direct (YouTube search rejects some datacenter IPs)."""
+    engine = "yt" if str(engine).lower().startswith("yt") else "sc"
+    target = ("ytsearch1:" if engine == "yt" else "scsearch1:") + query.strip()
+    last_err = None
+    for proxy in (_proxy_for(target), None):
+        try:
+            opts = _base_opts()
+            opts["noplaylist"] = False
+            opts["skip_download"] = True
+            opts["socket_timeout"] = 20
+            opts["proxy"] = proxy
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+            entries = info.get("entries") or []
+            first = next((e for e in entries if e), None)
+            if not first:
+                raise RuntimeError("no results for " + query)
+            return {"id": first.get("id"), "title": first.get("title"),
+                    "uploader": first.get("uploader"),
+                    "duration": first.get("duration"),
+                    "webpage_url": first.get("webpage_url") or first.get("url") or "",
+                    "engine": engine}
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
+
 FORMAT_FOR_QUALITY = {
     "360": "bv*[height<=360]+ba/b[height<=360]/b",
     "480": "bv*[height<=480]+ba/b[height<=480]/b",
@@ -558,7 +589,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/":
             return self._send(200, {"ok": True, "proxy": PROXY_UP})
-        if u.path not in ("/info", "/file", "/dlall", "/jav"):
+        if u.path not in ("/info", "/file", "/dlall", "/jav", "/search"):
             return self._send(404, {"error": "not found"})
         if TOKEN and not hmac.compare_digest(q.get("token", [""])[0], TOKEN):
             return self._send(401, {"error": "unauthorized"})
@@ -576,6 +607,15 @@ class Handler(BaseHTTPRequestHandler):
                 if tried:
                     body["tried"] = tried
                 return self._send(502, body)
+                if u.path == "/search":
+            query = q.get("q", [""])[0].strip()
+            engine = q.get("engine", ["sc"])[0]
+            if not query:
+                return self._send(400, {"error": "missing q (use ?q=song name)"})
+            try:
+                return self._send(200, search_first(query, engine))
+            except Exception as e:
+                return self._send(502, {"error": str(e)[:500], "proxy": PROXY_UP})
         url = q.get("url", [""])[0]
         if not url.startswith(("http://", "https://")):
             return self._send(400, {"error": "bad url"})
