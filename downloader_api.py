@@ -607,7 +607,7 @@ class Handler(BaseHTTPRequestHandler):
                 if tried:
                     body["tried"] = tried
                 return self._send(502, body)
-                if u.path == "/search":
+if u.path == "/search":
             query = q.get("q", [""])[0].strip()
             engine = q.get("engine", ["sc"])[0]
             if not query:
